@@ -163,6 +163,11 @@ temp.txt
 /assets/assests/
 
 
+# ─── NIM model benchmark (isolated, never commit) ────────────────────────────
+# Standalone benchmark that talks to NVIDIA's API. Has its own venv, API key,
+# and result dumps — none of which belong in the app repo.
+/nim-bench/
+
 # ─── Misc ────────────────────────────────────────────────────────────────────
 *.tmp
 *.bak

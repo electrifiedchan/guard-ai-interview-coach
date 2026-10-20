@@ -1449,6 +1449,7 @@ Hard rules:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
             max_tokens=520,
+            extra_body=llm_config.extra_body_for(llm_config.chat_model()),
         )
         ai_report = completion.choices[0].message.content
     except Exception as e:
@@ -1805,6 +1806,7 @@ confidence, tone, or body-language observations. No markdown or extra prose."""
             messages=[{"role": "user", "content": prompt}],
             temperature=0.6,
             max_tokens=800,
+            extra_body=llm_config.extra_body_for(llm_config.chat_model()),
         )
 
         raw_report = completion.choices[0].message.content.strip()

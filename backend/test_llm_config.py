@@ -178,9 +178,15 @@ with _EnvSandbox(LLM_MODE="nvidia"):
 with _EnvSandbox(LLM_MODE="nvidia", NVIDIA_MODEL=llm_config.NVIDIA_FALLBACK_MODEL):
     # Pointing the primary env override at the standby collapses the list — the
     # dedupe must not leave the same model queued twice.
-    check("primary==standby collapses to one entry",
+    check("primary==standby is not queued twice",
           llm_config.cloud_models_for("nvidia"),
-          [llm_config.NVIDIA_FALLBACK_MODEL])
+          [llm_config.NVIDIA_FALLBACK_MODEL, llm_config.NVIDIA_FALLBACK_MODEL_2])
+
+
+print("\nnemotron thinking is switched off, other models get no extra fields:")
+check("nemotron primary gets thinking off",
+      llm_config.extra_body_for(llm_config.NVIDIA_MODEL), llm_config.NEMOTRON_THINKING_OFF)
+check("non-nemotron model gets nothing", llm_config.extra_body_for("qwen2.5:3b"), None)
 
 
 print("\nclient points at the right endpoint:")

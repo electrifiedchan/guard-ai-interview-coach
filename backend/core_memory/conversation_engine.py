@@ -7,6 +7,7 @@ import time
 import logging
 from enum import Enum
 from dataclasses import dataclass, field
+import httpx
 from openai import AsyncOpenAI
 
 from . import llm_config
@@ -303,6 +304,10 @@ SPOKEN_REPLY_MAX_TOKENS = 512
 VERDICT_MAX_TOKENS = 768
 VERDICT_TIMEOUT_SEC = 45.0
 TURN_TIMEOUT_SEC = 20.0
+# How many recent turns to include in each LLM call. The full history grows
+# linearly and is the main cause of late-turn slowdown; 6 turns (3 exchanges)
+# keeps enough thread-memory for coherent follow-up without ballooning the prompt.
+HISTORY_WINDOW = 6
 
 # A cloud model that fails is skipped for this long before the cascade spends
 # another timeout probing it, so a degraded primary hands off to its hot standby
@@ -424,6 +429,9 @@ class ConversationEngine:
                 if self._cooling(name, model):
                     continue
                 call_kwargs = dict(kwargs)
+                extra = llm_config.extra_body_for(model)
+                if extra:
+                    call_kwargs["extra_body"] = extra
                 if model == llm_config.cloud_model_for(name):
                     # The primary is meant to be fast; don't let a hang spend the
                     # caller's whole ceiling before the standby gets its turn.
@@ -444,6 +452,17 @@ class ConversationEngine:
                     )
                     logger.warning(f"⚠️  Cloud model '{name}: {model}' unavailable: {e}")
 
+        # Every cloud rung is down — try the free custom Llama 8B endpoint before
+        # falling back to a local model. It needs no key and is always available.
+        if llm_config.CLOUD_PROVIDERS.get("custom_llama"):
+            logger.warning("⚠️  All keyed clouds down — trying free Llama 8B endpoint")
+            text = await self._complete_custom_http(
+                messages=kwargs.get("messages", []),
+                timeout=kwargs.get("timeout", TURN_TIMEOUT_SEC),
+            )
+            if text:
+                return text
+
         # Every cloud rung is down — serve a local model if one is listening.
         if not llm_config.ollama_reachable(force=True):
             logger.error(
@@ -462,6 +481,31 @@ class ConversationEngine:
             return completion.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Local fallback also failed: {e}")
+            return None
+
+    async def _complete_custom_http(self, messages: list[dict], timeout: float) -> str | None:
+        """Call a non-OpenAI-compatible provider (e.g. the free Cloudflare/Llama 8B
+        endpoint) that speaks POST /chat {messages:[...]} -> {answer:"..."}.
+
+        Returns the answer string, or None on any error so the cascade can move on.
+        """
+        spec = llm_config.CLOUD_PROVIDERS.get("custom_llama", {})
+        url = spec.get("base_url", "").rstrip("/") + "/chat"
+        payload = {"messages": messages}
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                logger.warning(f"custom_llama HTTP {resp.status_code}")
+                return None
+            answer = resp.json().get("answer")
+            # When the reply is JSON (the final report), the worker hands it back
+            # already parsed — a dict, not text — so turn it back into text.
+            if isinstance(answer, (dict, list)):
+                answer = json.dumps(answer)
+            return (answer or "").strip() or None
+        except Exception as e:
+            logger.warning(f"custom_llama call failed: {e}")
             return None
 
     def _prune_sessions(self) -> None:
@@ -819,8 +863,12 @@ Interview topics to weave in naturally (don't read verbatim — adapt to convers
             {"role": "system", "content": system_prompt + "\n\n" + resume_context},
         ]
 
-        # Add conversation history as alternating messages
-        for turn in session.conversation_history:
+        # Add the most-recent turns only — sending the full history every turn
+        # causes the prompt to grow linearly, which is the main reason later
+        # turns feel slower. 6 turns (3 candidate + 3 interviewer exchanges) is
+        # enough for the model to track the thread; earlier context is already
+        # baked into the resume + question plan in the system message above.
+        for turn in session.conversation_history[-HISTORY_WINDOW:]:
             role = "assistant" if turn.role == "interviewer" else "user"
             messages.append({"role": role, "content": turn.content})
 

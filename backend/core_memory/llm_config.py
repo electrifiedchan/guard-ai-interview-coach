@@ -29,29 +29,22 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-# PRIMARY. The old primary, meta/llama-3.1-8b-instruct, reached end of life on
-# 2026-08-26 and now returns HTTP 410 Gone — so every interview turn silently
-# fell through to the standby below, which is why replies stopped using the
-# candidate's name and started leaking a reasoning trace.
-#
-# gpt-oss-20b is a reasoning model, but on NVIDIA's endpoint it keeps that trace
-# in a separate `reasoning` field and returns a clean answer in `content` — so
-# nothing to strip. Verified 2026-09: honours response_format=json_object for
-# generate_questions, and a name-directed prompt ("Address them as Sai") comes
-# back using the name ("Hi Sai, …"). One catch this swap required: the reasoning
-# trace burns ~150-330 completion tokens BEFORE the visible answer, so the short
-# interview calls in conversation_engine.py had their caps raised
-# (SPOKEN_REPLY_MAX_TOKENS / VERDICT_MAX_TOKENS). At the old 150-token cap the
-# reasoning ate the whole budget and the reply came back empty — a silent AI.
-NVIDIA_MODEL = "openai/gpt-oss-20b"
+# PRIMARY. Benchmarked 2026-10 by replaying the app's exact requests (question
+# plan, opening, three turns, final report) against a real resume, with
+# thinking switched off (see extra_body_for). lightning-30b was the only model
+# to pass all 12 calls, and the fastest: 0.5-0.8 s per spoken reply, ~2 s for
+# the question plan, ~1.5 s for the report. gpt-oss-20b — an earlier primary —
+# timed out in Phase 1 and returned ~23 s TTFT in Phase 2, making it unusable
+# for a live interview where the user is waiting.
+NVIDIA_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
-# Hot standby on the SAME vendor: when the fast primary above is failing or
-# hanging, the conversation engine tries this larger model before it changes
-# clouds. Measured alive at ~5s with clean JSON and no reasoning trace to strip
-# (2026-08), unlike mistral-nemotron/gemma-4-31b. It is deliberately the
-# slower/bigger one — the 8B carries every healthy turn; this only steps in when
-# the 8B can't. Wired in via CLOUD_PROVIDERS["nvidia"]["fallbacks"].
-NVIDIA_FALLBACK_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+# Fallbacks on the SAME vendor, tried in order after the primary fails.
+# Same benchmark, same thinking-off setting:
+#   #1 fallback — super-120b: 10/12, 0.7-1.7 s replies, 5-8 s report; twice
+#                             opened without asking a question
+#   #2 fallback — ultra-550b: 11/12, 1-6 s replies, 2-3 s report
+NVIDIA_FALLBACK_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+NVIDIA_FALLBACK_MODEL_2 = "nvidia/nemotron-3-ultra-550b-a55b"
 
 # ── Cloud providers ──────────────────────────────────────────────────────
 # All of these speak the OpenAI wire protocol, so supporting one more is a row
@@ -74,7 +67,8 @@ CLOUD_PROVIDERS = {
         "model": NVIDIA_MODEL,
         # Same-vendor hot standbys, tried in order after `model` when it fails
         # and before the cascade changes clouds. See cloud_models_for().
-        "fallbacks": [NVIDIA_FALLBACK_MODEL],
+        # super-120b, then ultra-550b — see the constants above.
+        "fallbacks": [NVIDIA_FALLBACK_MODEL, NVIDIA_FALLBACK_MODEL_2],
         "env_key": "NVIDIA_API_KEY",
         "prefix": "nvapi-",
         "console": "https://build.nvidia.com/settings/api-keys",
@@ -82,10 +76,24 @@ CLOUD_PROVIDERS = {
     "groq": {
         "label": "Groq",
         "base_url": "https://api.groq.com/openai/v1",
-        "model": "openai/gpt-oss-20b",
+        # llama-3.3-70b-versatile: current live model on Groq free tier (2026-10)
+        "model": "llama-3.3-70b-versatile",
         "env_key": "GROQ_API_KEY",
         "prefix": "gsk_",
         "console": "https://console.groq.com/keys",
+    },
+    # Free Cloudflare Workers endpoint backed by Llama 8B — no API key needed.
+    # Not OpenAI-compatible: POST /chat {messages:[...]} -> {answer:"..."}.
+    # Benchmarked 2026-10: ~0.9-1.3 s full round-trip (non-streaming).
+    # Used as a last-resort free fallback after NVIDIA and Groq.
+    "custom_llama": {
+        "label": "Llama 8B (free)",
+        "base_url": "https://interview-ai-api.mmnirupam.workers.dev",
+        "model": "llama-3.1-8b",
+        "env_key": "",          # no key needed
+        "prefix": "",
+        "console": "https://interview-ai-api.mmnirupam.workers.dev",
+        "non_openai": True,     # signals engine to use direct HTTP, not SDK
     },
 }
 
@@ -165,10 +173,17 @@ def provider_spec(name: str | None = None) -> dict:
 
 
 def api_key_for(name: str | None = None) -> str:
-    return os.getenv(provider_spec(name)["env_key"], "").strip()
+    env_key = provider_spec(name).get("env_key", "")
+    if not env_key:
+        return ""  # keyless provider — no env var to look up
+    return os.getenv(env_key, "").strip()
 
 
 def has_api_key(name: str | None = None) -> bool:
+    spec = provider_spec(name)
+    # Keyless providers (non_openai with no env_key) are always "available".
+    if spec.get("non_openai") and not spec.get("env_key"):
+        return True
     return bool(api_key_for(name))
 
 
@@ -305,6 +320,22 @@ def chat_model() -> str:
     if is_local():
         return os.getenv("OLLAMA_MODEL", OLLAMA_DEFAULT_MODEL)
     return cloud_model_for(cloud_provider())
+
+
+# Nemotron models "think" (a hidden reasoning trace) before answering unless told
+# not to, and this app does not stream, so the candidate waits out the whole
+# trace. Measured in-app on the exact interview requests with thinking on:
+# super-120b took 6-43 s a turn and broke the report JSON, and lightning-30b
+# came back empty every time because the trace ate its token budget. With this
+# switch: 0.5-1.7 s replies and valid JSON.
+NEMOTRON_THINKING_OFF = {"chat_template_kwargs": {"enable_thinking": False, "thinking": False}}
+
+
+def extra_body_for(model: str) -> dict | None:
+    """Vendor-specific request fields for `model`, passed as `extra_body=`."""
+    if model.startswith("nvidia/nemotron"):
+        return NEMOTRON_THINKING_OFF
+    return None
 
 
 def cloud_fallback_order() -> list[str]:

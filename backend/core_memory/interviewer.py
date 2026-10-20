@@ -19,14 +19,25 @@ logger = logging.getLogger(__name__)
 # Measured: ~560 completion tokens for a 4-question plan, so this leaves room.
 QUESTION_PLAN_MAX_TOKENS = 1500
 
+# The SDK's default wait is 10 minutes, so a stalled vendor froze the upload
+# screen. A healthy model answers in 2-10 s; past this, use the backup questions.
+QUESTION_PLAN_TIMEOUT_SEC = 30
+
 
 class AIInterviewer:
     def __init__(self):
         self._client: AsyncOpenAI | None = None
+        self._client_generation: int | None = None
 
     def _llm(self) -> AsyncOpenAI:
-        if self._client is None:
+        # Rebuilt when llm_config's generation changes (a brain switch, key edit
+        # or mode flip). A client cached forever kept posting to the backend it
+        # was built for, so switching from the dashboard sent the new model name
+        # to the old endpoint and every plan fell back to the generic questions.
+        gen = llm_config.config_generation()
+        if self._client is None or self._client_generation != gen:
             self._client = llm_config.make_client()
+            self._client_generation = gen
             logger.info(f"🧠 Interviewer LLM: {llm_config.describe()}")
         return self._client
 
@@ -77,12 +88,15 @@ Do not include markdown blocks, pleasantries, or extra text. Just the JSON objec
             # 3B local model from answering with prose. Without it the parse
             # fails often enough that every session falls back to the canned
             # questions — which looks like the local path "working".
+            model = llm_config.chat_model()
             completion = await self._llm().chat.completions.create(
-                model=llm_config.chat_model(),
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
                 max_tokens=QUESTION_PLAN_MAX_TOKENS,
                 response_format={"type": "json_object"},
+                extra_body=llm_config.extra_body_for(model),
+                timeout=QUESTION_PLAN_TIMEOUT_SEC,
             )
             questions = llm_config.extract_json(completion.choices[0].message.content)
 
