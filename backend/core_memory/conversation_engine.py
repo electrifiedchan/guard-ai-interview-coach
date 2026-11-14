@@ -656,13 +656,28 @@ class ConversationEngine:
                 return candidate
         return "Can you walk me through a different example from your experience?"
 
-    async def generate_final_verdict(self, session_id: str) -> dict:
+    async def generate_final_verdict(
+        self, session_id: str, focus_override: float | None = None
+    ) -> dict:
+        """Build the coaching verdict.
+
+        `focus_override` is the session's average composure from the recorded
+        camera frames, the same number the dashboard and history show for the
+        run. When given it is the score, and the coaching is written against it.
+        Without it (the /practice page, which records no frames) the score falls
+        back to the mean of the per-answer readings.
+        """
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
         session.is_complete = True
-        avg_focus = sum(session.focus_scores) / len(session.focus_scores) if session.focus_scores else 100.0
+        if focus_override is not None:
+            avg_focus = float(focus_override)
+            focus_source = "camera"
+        else:
+            avg_focus = sum(session.focus_scores) / len(session.focus_scores) if session.focus_scores else 100.0
+            focus_source = "turns"
 
         transcript_block = ""
         for turn in session.conversation_history:
@@ -738,6 +753,9 @@ Rules:
             "report": report,
             "coaching": coaching,
             "focus_score": round(avg_focus, 1),
+            # "camera": the average over every recorded frame (matches history).
+            # "turns": per-answer fallback with no camera data behind it.
+            "focus_source": focus_source,
             "focus_label": focus_label,
             "turns_completed": session.current_turn,
             "personas_experienced": list({t.persona for t in session.conversation_history if t.role == "interviewer"}),

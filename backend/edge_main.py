@@ -35,9 +35,11 @@ from core_memory.timeline import (
     close_moment,
     get_timeline,
     get_dashboard_summary,
+    get_session_focus,
 )
 from core_memory.episodes import EpisodeTracker
 from core_memory.interrupts import InterruptDirector
+from core_memory.focus_events import FOCUS_EVENT_KINDS, record_focus_event
 from core_memory.voice_engine import transcribe_audio as whisper_transcribe
 import voice_engine
 import tempfile
@@ -690,6 +692,39 @@ async def analyze_frame(payload: FramePayload, background_tasks: BackgroundTasks
 
 
 # ---------------------------------------------------------------------------
+# /api/v1/session-event — browser focus events (tab switch, fullscreen exit)
+# ---------------------------------------------------------------------------
+class SessionEventPayload(BaseModel):
+    # The vision session id ("{candidate_id}__{rand}") that the frames use, so
+    # the event lands on the same timeline as the run it happened in.
+    session_id: str
+    kind: str
+    # Measured client-side with a monotonic clock; anchored to server time here.
+    duration_sec: float
+
+
+@app.post("/api/v1/session-event")
+async def record_session_event(payload: SessionEventPayload):
+    """Record one completed away period as a closed moment.
+
+    Sent when the candidate comes back, because only then is the duration known.
+    It is not fed into the BEA: leaving the window is reported on its own and
+    does not move the composure curve.
+    """
+    session_id = (payload.session_id or "").strip()
+    if not session_id or len(session_id) > 200:
+        raise HTTPException(status_code=400, detail="Invalid session_id.")
+    if payload.kind not in FOCUS_EVENT_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown event kind.")
+    try:
+        event = record_focus_event(session_id, payload.kind, payload.duration_sec)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    logger.info(f"🪟  FOCUS EVENT: {event['kind']} {event['duration_sec']:.1f}s [{session_id}]")
+    return event
+
+
+# ---------------------------------------------------------------------------
 # /api/v1/scan-objects — fast prop sweep, decoupled from the telemetry loop
 # ---------------------------------------------------------------------------
 class ObjectScanPayload(BaseModel):
@@ -1142,12 +1177,17 @@ VIOLATION_TYPES = {
     "MULTIPLE_FACES":  lambda row: (row.get("faces_detected") or 0) >= 2,
     "NO_FACE":         lambda row: (row.get("faces_detected") or 0) == 0,
     "TALKING":         lambda row: bool(row.get("is_talking")),
+    # Browser focus events (see core_memory/focus_events.py). Never in a frame;
+    # they arrive as closed moments from /api/v1/session-event.
+    "TAB_SWITCH":      lambda row: False,
+    "FULLSCREEN_EXIT": lambda row: False,
 }
 
 # Types that only the moments table can supply — YOLO labels are not stored per
-# frame. Every other type is derived from timeline_frames above, so counting it
-# from moments as well would bill the same behaviour twice.
-_MOMENT_ONLY_TYPES = ("MOBILE_DEVICE", "PROHIBITED_ITEM")
+# frame, and focus events have no frame at all. Every other type is derived
+# from timeline_frames above, so counting it from moments as well would bill the
+# same behaviour twice.
+_MOMENT_ONLY_TYPES = ("MOBILE_DEVICE", "PROHIBITED_ITEM", *FOCUS_EVENT_KINDS)
 
 
 def _classify_moment_caption(caption: str) -> str | None:
@@ -1360,6 +1400,8 @@ async def get_session_breakdown(candidate_id: str, since: str | None = None):
 VIOLATION_LABELS_FULL = {
     "DOWN_GAZE": "looking down (off-screen / at lap)",
     "SIDE_GAZE": "looking sideways or up (off-screen)",
+    "TAB_SWITCH": "leaving the interview window (tab or app switch)",
+    "FULLSCREEN_EXIT": "exiting fullscreen",
 }
 
 
@@ -1847,6 +1889,11 @@ class ConversationTurnRequest(BaseModel):
 
 class EndSessionRequest(BaseModel):
     session_id: str
+    # The camera/vision run id ("{candidate_id}__{rand}") whose frames back the
+    # history entry for this session. Not the same id as `session_id`, which is
+    # the interview conversation. When present, the focus score is read from
+    # those frames so the report and the history can never disagree.
+    vision_session_id: str | None = None
 
 
 @app.post("/api/v1/interview/start-session")
@@ -1890,7 +1937,20 @@ async def interview_conversation_turn(payload: ConversationTurnRequest):
 async def end_interview_session(payload: EndSessionRequest):
     """Generate the final empathetic coaching verdict for the interview session."""
     try:
-        result = await conversation_engine.generate_final_verdict(payload.session_id)
+        focus_override = None
+        vision_id = (payload.vision_session_id or "").strip()
+        if vision_id:
+            # The last telemetry frame is written by a background task and may
+            # still be in flight when the page presses End. The verdict call
+            # that follows takes seconds, so half a second here costs nothing
+            # and keeps that frame in the average.
+            await asyncio.sleep(0.5)
+            focus = get_session_focus(vision_id)
+            if focus:
+                focus_override = focus["avg_composure"]
+        result = await conversation_engine.generate_final_verdict(
+            payload.session_id, focus_override=focus_override
+        )
         logger.info(f"📋 Session {payload.session_id} verdict generated")
         return result
     except ValueError as e:

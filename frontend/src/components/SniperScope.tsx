@@ -141,10 +141,16 @@ interface SniperScopeProps {
    * and vice versa. One owner, one queue.
    */
   onInterrupt?: (interrupt: ScopeInterrupt) => void;
+  /**
+   * Called synchronously inside the Engage click, before the camera opens.
+   * The page uses it to enter fullscreen, which browsers only allow from a
+   * user gesture; by the time the interview starts that gesture is long gone.
+   */
+  onEngageClick?: () => void;
   ref?: Ref<SniperScopeHandle>;
 }
 
-export default function SniperScope({ onTelemetryUpdate, onDisengage, onPersonaChange, onInterrupt, ref }: SniperScopeProps) {
+export default function SniperScope({ onTelemetryUpdate, onDisengage, onPersonaChange, onInterrupt, onEngageClick, ref }: SniperScopeProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -1627,7 +1633,10 @@ export default function SniperScope({ onTelemetryUpdate, onDisengage, onPersonaC
         <div className="absolute bottom-3 right-3 z-20 flex gap-2">
           {!isScanning ? (
             <button
-              onClick={startCamera}
+              onClick={() => {
+                onEngageClick?.();
+                void startCamera();
+              }}
               className="px-4 h-9 rounded-md bg-[var(--color-signal)]/15 text-[var(--color-signal)] text-[13px] font-medium border border-[var(--color-signal)]/40 hover:bg-[var(--color-signal)]/25 hover:border-[var(--color-signal)] transition-colors cursor-pointer backdrop-blur-md"
             >
               Engage sentry

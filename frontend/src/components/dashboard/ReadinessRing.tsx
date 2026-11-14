@@ -37,7 +37,7 @@ export default function ReadinessRing({ readiness }: ReadinessRingProps) {
   const offset = CIRC * (1 - score / 100);
 
   const delta = readiness?.delta_vs_prev ?? 0;
-  const deltaLabel = delta === 0 ? null : `${delta > 0 ? "+" : ""}${delta} vs last week`;
+  const deltaLabel = delta === 0 ? null : `${delta > 0 ? "+" : ""}${delta} from your latest session`;
 
   return (
     <div className="flex flex-col items-center">

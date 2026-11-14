@@ -3,13 +3,14 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { Smartphone, User, Users, Bot } from "lucide-react";
+import { Smartphone, User, Users, Bot, EyeOff, Maximize } from "lucide-react";
 import SniperScope, { RiskPacket, ScopeInterrupt, SniperScopeHandle } from "@/components/SniperScope";
 import { PERSONA_LABELS, DEFAULT_PERSONA, type PersonaId } from "@/lib/personas";
 import VoiceOrb, { VoiceState } from "@/components/VoiceOrb";
 import LoadingOverlay from "@/components/LoadingOverlay";
 import DashboardButton from "@/components/DashboardButton";
 import { useVAD } from "@/hooks/useVAD";
+import { useFocusGuard, type FocusEpisode } from "@/hooks/useFocusGuard";
 import { beginSpeech, endSpeech, noteWordBoundary } from "@/lib/speechLevel";
 
 
@@ -31,6 +32,14 @@ const NUDGE_TTL_MS = 15_000;
 // How long the banner stays up. Long enough to read after looking back at the
 // screen, short enough not to sit over the video for the rest of the run.
 const NUDGE_BANNER_MS = 9_000;
+
+function fmtAway(sec: number): string {
+  const whole = Math.max(1, Math.round(sec));
+  if (whole < 60) return `${whole} second${whole === 1 ? "" : "s"}`;
+  const m = Math.floor(whole / 60);
+  const s = whole % 60;
+  return s ? `${m}m ${s}s` : `${m} minute${m === 1 ? "" : "s"}`;
+}
 
 export default function SentryPage() {
   const router = useRouter();
@@ -92,6 +101,22 @@ export default function SentryPage() {
    */
   const sessionEndingRef = useRef(false);
 
+  /**
+   * True while the candidate is away from the window (tab switch, Alt-Tab,
+   * fullscreen exit) and until they press Continue. Every path that would
+   * speak or open the microphone checks it, the same way they check
+   * sessionEndingRef — a turn already in flight cannot be cancelled, so it is
+   * made to stop at its next step instead, and resumeInterview() picks up.
+   */
+  const interviewPausedRef = useRef(false);
+  /** The interviewer's latest line, and whether the candidate heard all of it. */
+  const lastLineRef = useRef("");
+  const lineHeardRef = useRef(true);
+  /** The engine said the interview is complete; end it once the last line lands. */
+  const completeRef = useRef(false);
+  /** Resolves the in-flight speakText() promise, so a pause can cut it off. */
+  const settleSpeechRef = useRef<((ok: boolean) => void) | null>(null);
+
   // VAD hook
   const { isVoiceActive, audioLevel, audioLevelRef, startListening, stopListening } = useVAD({
     silenceThresholdMs: 2500,
@@ -113,6 +138,9 @@ export default function SentryPage() {
    * through here so a failure is something the user can actually see and fix.
    */
   const beginListening = useCallback(async () => {
+    // Never open the mic while the candidate is away or the run is over;
+    // resumeInterview() reopens it when they come back.
+    if (interviewPausedRef.current || sessionEndingRef.current) return;
     try {
       await startListening();
     } catch (err) {
@@ -154,14 +182,29 @@ export default function SentryPage() {
     "IDLE";
 
   // TTS
-  const speakText = useCallback((text: string): Promise<void> => {
+  // Resolves true when the utterance played to the end, false when it was
+  // refused or cut off (cancelled, errored, or the interview paused).
+  const speakText = useCallback((text: string): Promise<boolean> => {
     return new Promise((resolve) => {
       // The run ended while this turn was still in flight. Cancelling the
       // synthesiser at that moment can't suppress an utterance that hasn't been
-      // queued yet, so the request has to be refused here instead.
-      if (sessionEndingRef.current) { resolve(); return; }
-      if (!("speechSynthesis" in window)) { resolve(); return; }
+      // queued yet, so the request has to be refused here instead. Same for a
+      // reply that lands while the candidate is away from the window.
+      if (sessionEndingRef.current || interviewPausedRef.current) { resolve(false); return; }
+      if (!("speechSynthesis" in window)) { resolve(true); return; }
+      // The cancel() below cuts off whatever was playing; settle its promise
+      // now rather than relying on onend/onerror, which cancel() does not
+      // reliably fire.
+      settleSpeechRef.current?.(false);
       window.speechSynthesis.cancel();
+      let settled = false;
+      const settle = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (settleSpeechRef.current === settle) settleSpeechRef.current = null;
+        resolve(ok);
+      };
+      settleSpeechRef.current = settle;
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = 0.92;
       utterance.pitch = 0.85;
@@ -186,12 +229,25 @@ export default function SentryPage() {
         if (e.name === "sentence") return; // word events carry the rhythm
         noteWordBoundary(e.charLength);
       };
-      utterance.onend = () => { endSpeech(); resolve(); };
-      utterance.onerror = () => { endSpeech(); resolve(); };
+      utterance.onend = () => { endSpeech(); settle(true); };
+      utterance.onerror = () => { endSpeech(); settle(false); };
       window.speechSynthesis.speak(utterance);
 
     });
   }, []);
+
+  /**
+   * Speak one interviewer line and remember whether it was heard in full. If a
+   * pause cuts it off, resumeInterview() repeats it, because the candidate
+   * cannot answer a question they only heard half of.
+   */
+  const speakInterviewer = useCallback(async (text: string): Promise<boolean> => {
+    lastLineRef.current = text;
+    lineHeardRef.current = false;
+    const ok = await speakText(text);
+    if (ok && !interviewPausedRef.current) lineHeardRef.current = true;
+    return lineHeardRef.current;
+  }, [speakText]);
 
   /**
    * Say a coaching reminder out loud, mid-session.
@@ -214,7 +270,7 @@ export default function SentryPage() {
    * the moment it lands.
    */
   const speakNudge = useCallback(async (nudge: ScopeInterrupt) => {
-    if (sessionEndingRef.current || nudgeSpeakingRef.current) return;
+    if (sessionEndingRef.current || nudgeSpeakingRef.current || interviewPausedRef.current) return;
 
     nudgeSpeakingRef.current = true;
     // Fresh object on purpose. A deferred reminder already put the banner up, and
@@ -247,7 +303,9 @@ export default function SentryPage() {
    * this is called on a rising edge, not every frame.
    */
   const handleInterrupt = useCallback((nudge: ScopeInterrupt) => {
-    if (sessionEndingRef.current) return;
+    // Nobody is at the screen to hear it while the interview is paused. The
+    // sighting is still in the report.
+    if (sessionEndingRef.current || interviewPausedRef.current) return;
 
     const busy =
       nudgeSpeakingRef.current ||
@@ -301,6 +359,58 @@ export default function SentryPage() {
     return () => clearTimeout(t);
   }, [coachNudge]);
 
+  /**
+   * The candidate left the window (or fullscreen) for longer than the grace
+   * period. Stop talking and close the mic so the interviewer neither asks a
+   * question into an empty room nor records whatever is happening elsewhere.
+   * Audio captured up to this point is discarded by handleSpeechEnd; the
+   * candidate answers again after resuming.
+   */
+  const pauseInterview = useCallback(() => {
+    if (sessionEndingRef.current) return;
+    interviewPausedRef.current = true;
+    stopListening();
+    window.speechSynthesis?.cancel();
+    settleSpeechRef.current?.(false);
+    endSpeech();
+    pendingNudgeRef.current = null;
+    setCoachNudge(null);
+    setLiveTranscript("INTERVIEW PAUSED. RETURN TO THE WINDOW TO CONTINUE.");
+  }, [stopListening]);
+
+  // Bound below, once endSession exists; the guard calls through it.
+  const resumeInterviewRef = useRef<() => void>(() => {});
+
+  /** Record one away period on the same timeline as the run's frames. */
+  const reportFocusEpisode = useCallback((episode: FocusEpisode) => {
+    let visionSession = "";
+    try {
+      visionSession = sessionStorage.getItem("guard_vision_session") || "";
+    } catch {
+      return;
+    }
+    if (!visionSession) return;
+    // keepalive so the event still lands if the page is being torn down.
+    fetch(`${API_BASE}/api/v1/session-event`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify({
+        session_id: visionSession,
+        kind: episode.kind,
+        duration_sec: episode.durationSec,
+      }),
+    }).catch((err) => console.warn("[FOCUS] Could not record event:", err));
+  }, []);
+
+  const focusGuard = useFocusGuard({
+    active: interviewActive && !isGenerating,
+    onPause: pauseInterview,
+    onResume: () => resumeInterviewRef.current(),
+    onEpisode: reportFocusEpisode,
+  });
+  const { stop: stopFocusGuard, enterFullscreen } = focusGuard;
+
   // When user clicks "Disengage" in SniperScope — stop everything
   const handleDisengage = useCallback(() => {
     // Latch before tearing anything down, so a turn mid-flight sees the run is
@@ -308,6 +418,10 @@ export default function SentryPage() {
     // what is already queued; the reply still on its way back from the backend
     // would arrive afterwards and start speaking again.
     sessionEndingRef.current = true;
+    // Records any away period still open, leaves fullscreen, stops watching.
+    stopFocusGuard();
+    interviewPausedRef.current = false;
+    settleSpeechRef.current?.(false);
     // A queued reminder must not survive the run it belonged to.
     pendingNudgeRef.current = null;
     setCoachNudge(null);
@@ -327,7 +441,7 @@ export default function SentryPage() {
     // leave the page sending friendly_hr while the picker still showed Tech Lead
     // — practice resets because its handleReset tears down to the upload screen,
     // which unmounts the picker entirely. Different situation, different rule.
-  }, [stopListening]);
+  }, [stopListening, stopFocusGuard]);
 
   // Always points at the current render's startInterviewFlow. handleTelemetry
   // must keep a stable identity (SniperScope binds it once), but with empty
@@ -358,6 +472,10 @@ export default function SentryPage() {
     // Re-arm. Disengage latches the flag to kill the previous run; pressing
     // Engage starts a new one, and without this reset it would be born dead.
     sessionEndingRef.current = false;
+    interviewPausedRef.current = false;
+    lastLineRef.current = "";
+    lineHeardRef.current = true;
+    completeRef.current = false;
     setInterviewActive(true);
     setChatHistory([]);
     setTurnState("processing");
@@ -384,10 +502,11 @@ export default function SentryPage() {
 
       setTurnState("ai-speaking");
       setLiveTranscript(`AI: ${data.opening_message}`);
-      await speakText(data.opening_message);
+      await speakInterviewer(data.opening_message);
 
-      // Disengaged during the opening line — leave the mic shut.
-      if (sessionEndingRef.current) return;
+      // Disengaged during the opening line — leave the mic shut. Paused: the
+      // resume path repeats the line and opens the mic.
+      if (sessionEndingRef.current || interviewPausedRef.current) return;
 
       setTurnState("listening");
       setLiveTranscript("MICROPHONE LIVE. LISTENING…");
@@ -401,7 +520,7 @@ export default function SentryPage() {
       interviewStartedRef.current = false;
       setInterviewActive(false);
     }
-  }, [startingPersona, speakText, beginListening]);
+  }, [startingPersona, speakInterviewer, beginListening]);
 
   // Reassigned every render, which is what makes the persona pick reach the
   // backend: handleTelemetry is bound into SniperScope once and calls through
@@ -413,6 +532,10 @@ export default function SentryPage() {
     // The run is over (or never legitimately started) — discard the audio
     // instead of transcribing it and posting a turn nobody is listening for.
     if (sessionEndingRef.current || !sessionIdRef.current) return;
+    // Captured as the candidate walked away (pausing stops the recorder, which
+    // flushes what it had). A half answer is worse than none: drop it and let
+    // them answer again after resuming.
+    if (interviewPausedRef.current) return;
 
     setTurnState("processing");
     setIsTranscribing(true);
@@ -480,17 +603,20 @@ export default function SentryPage() {
       }]);
 
       if (turnData.is_complete) {
+        completeRef.current = true;
         setTurnState("ai-speaking");
         setLiveTranscript(`AI: ${turnData.response}`);
-        await speakText(turnData.response);
+        await speakInterviewer(turnData.response);
+        // Paused during the closing line: resumeInterview() repeats it, then ends.
+        if (interviewPausedRef.current) return;
         await endSession();
         return;
       }
 
       setTurnState("ai-speaking");
       setLiveTranscript(`AI: ${turnData.response}`);
-      await speakText(turnData.response);
-      if (sessionEndingRef.current) return;
+      await speakInterviewer(turnData.response);
+      if (sessionEndingRef.current || interviewPausedRef.current) return;
       setTurnState("listening");
       setLiveTranscript("MICROPHONE LIVE. LISTENING…");
       beginListening();
@@ -512,6 +638,11 @@ export default function SentryPage() {
   // End session → navigate to report
   const endSession = useCallback(async () => {
     sessionEndingRef.current = true;
+    // Before anything else: records any away period still open and leaves
+    // fullscreen, so the report is not shown in a locked fullscreen window.
+    stopFocusGuard();
+    interviewPausedRef.current = false;
+    settleSpeechRef.current?.(false);
     setIsGenerating(true);
     stopListening();
     window.speechSynthesis?.cancel();
@@ -524,7 +655,19 @@ export default function SentryPage() {
       const res = await fetch(`${API_BASE}/api/v1/interview/end-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionIdRef.current }),
+        body: JSON.stringify({
+          session_id: sessionIdRef.current,
+          // The camera run behind this session's history entry. The backend
+          // reads the focus score from those frames so the report and the
+          // history show the same number.
+          vision_session_id: (() => {
+            try {
+              return sessionStorage.getItem("guard_vision_session") || undefined;
+            } catch {
+              return undefined;
+            }
+          })(),
+        }),
       });
 
       if (!res.ok) throw new Error("Verdict generation failed");
@@ -536,10 +679,16 @@ export default function SentryPage() {
           report: data.report,
           coaching: data.coaching,
           // Source field is `focus_score`; the sessionStorage key stays
-          // `average_focus_score` because /report reads that. Reading the
-          // storage-side name off the response gave undefined, and `|| 0`
-          // rendered it as a real 0 — the "focus score always 0%" bug.
-          average_focus_score: Math.round(data.focus_score ?? 0),
+          // `average_focus_score` because /report reads that.
+          //
+          // Only kept when it was measured from the camera frames, the same
+          // data the history uses. A per-answer fallback has no history entry
+          // to match, so it is dropped rather than shown as if it were one,
+          // and the report shows "no camera data" instead of a made-up score.
+          average_focus_score:
+            data.focus_source === "camera" && typeof data.focus_score === "number"
+              ? data.focus_score
+              : null,
           turns_completed: data.turns_completed || 0,
         })
       );
@@ -551,7 +700,44 @@ export default function SentryPage() {
       setIsGenerating(false);
       setLiveTranscript("ERROR: REPORT GENERATION FAILED.");
     }
-  }, [stopListening, router]);
+  }, [stopListening, router, stopFocusGuard]);
+
+  /**
+   * The candidate is back and pressed Continue. Pick up where the pause hit:
+   *
+   * - a turn still in flight (`processing`) finishes on its own;
+   * - an interviewer line that was cut off, or that arrived while they were
+   *   away and was never spoken, is said again in full;
+   * - otherwise they were mid-answer, so the mic reopens for a fresh answer.
+   */
+  const resumeInterview = useCallback(async () => {
+    interviewPausedRef.current = false;
+    if (sessionEndingRef.current || !interviewStartedRef.current) return;
+
+    const state = turnStateRef.current;
+    if (state === "processing") {
+      setLiveTranscript("RESUMING INTERVIEW…");
+      return;
+    }
+    if (state === "idle") return;
+
+    if (!lineHeardRef.current && lastLineRef.current) {
+      setTurnState("ai-speaking");
+      setLiveTranscript(`AI: ${lastLineRef.current}`);
+      const heard = await speakInterviewer(lastLineRef.current);
+      if (!heard || sessionEndingRef.current) return;
+      if (completeRef.current) {
+        await endSession();
+        return;
+      }
+    }
+
+    if (!sessionIdRef.current) return;
+    setTurnState("listening");
+    setLiveTranscript("MICROPHONE LIVE. LISTENING…");
+    beginListening();
+  }, [speakInterviewer, endSession, beginListening]);
+  resumeInterviewRef.current = () => { void resumeInterview(); };
 
   return (
     <main className="h-screen bg-[var(--color-canvas)] flex flex-col px-5 md:px-8 py-5 text-[var(--color-parchment)] items-center overflow-y-auto xl:overflow-hidden">
@@ -619,6 +805,7 @@ export default function SentryPage() {
             onDisengage={handleDisengage}
             onPersonaChange={setStartingPersona}
             onInterrupt={handleInterrupt}
+            onEngageClick={() => { void enterFullscreen(); }}
           />
 
           {/* Coaching reminder. Amber, not red: this is a nudge about how the
@@ -676,10 +863,21 @@ export default function SentryPage() {
 
             {/* Before interview: simple transcript line */}
             {!interviewActive && (
-              <p className="text-[12.5px] leading-relaxed font-mono text-[var(--color-parchment)]">
-                <span className="text-[var(--color-fog)] mr-2">&gt;</span>
-                {liveTranscript}
-              </p>
+              <>
+                <p className="text-[12.5px] leading-relaxed font-mono text-[var(--color-parchment)]">
+                  <span className="text-[var(--color-fog)] mr-2">&gt;</span>
+                  {liveTranscript}
+                </p>
+                {/* Said before Engage, not discovered mid-answer. */}
+                <p className="mt-4 flex gap-2 text-[12px] leading-relaxed text-[var(--color-slate)]">
+                  <Maximize className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                  <span>
+                    The interview runs in fullscreen. If you switch tabs, change
+                    windows or leave fullscreen, it pauses until you come back,
+                    and the time away is noted in your report.
+                  </span>
+                </p>
+              </>
             )}
 
             {/* During interview: chat messages */}
@@ -738,6 +936,76 @@ export default function SentryPage() {
           {error}
         </div>
       )}
+
+      {/* Paused because the candidate left the window or fullscreen. Amber like
+          the coach nudge: it explains how the moment would read in a real
+          proctored interview, it does not accuse. */}
+      <AnimatePresence>
+        {focusGuard.paused && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm p-6"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="focus-pause-title"
+            aria-describedby="focus-pause-body"
+          >
+            <div className="w-full max-w-[480px] rounded-lg border border-amber-400/40 bg-[var(--color-surface)] p-6 flex flex-col gap-4">
+              <div className="flex items-center gap-3">
+                <span className="w-9 h-9 rounded-md bg-amber-400/10 flex items-center justify-center">
+                  {focusGuard.away
+                    ? <EyeOff className="h-4 w-4 text-amber-300" />
+                    : <Maximize className="h-4 w-4 text-amber-300" />}
+                </span>
+                <h2 id="focus-pause-title" className="text-[16px] font-semibold text-[var(--color-snow)]">
+                  {focusGuard.away ? "Interview paused" : "Welcome back"}
+                </h2>
+              </div>
+
+              <div id="focus-pause-body" className="flex flex-col gap-2 text-[13px] leading-relaxed text-[var(--color-parchment)]">
+                {focusGuard.away ? (
+                  <p>You left the interview window. Come back to this window to continue; the interviewer will wait.</p>
+                ) : (
+                  <>
+                    <p>
+                      {focusGuard.lastAwaySec > 0
+                        ? `You were away from the interview window for ${fmtAway(focusGuard.lastAwaySec)}.`
+                        : "You left fullscreen."}{" "}
+                      In a real proctored interview, leaving the window can end the session, so try to stay on this screen until you finish.
+                    </p>
+                    <p className="text-[12px] text-[var(--color-slate)]">
+                      Pause {focusGuard.reminders} this session · noted in your report.
+                    </p>
+                  </>
+                )}
+              </div>
+
+              {!focusGuard.away && (
+                <div className="flex flex-wrap items-center gap-3 pt-1">
+                  <button
+                    onClick={() => { void focusGuard.resume(); }}
+                    autoFocus
+                    className="h-9 px-4 rounded-md bg-[var(--color-signal)] text-[var(--color-canvas)] text-[13px] font-semibold hover:brightness-110 transition-all cursor-pointer flex items-center gap-2"
+                  >
+                    {focusGuard.fullscreenLost && <Maximize size={14} />}
+                    {focusGuard.fullscreenLost ? "Return to fullscreen and continue" : "Continue interview"}
+                  </button>
+                  <button
+                    onClick={() => endSession()}
+                    disabled={isGenerating || !sessionId}
+                    className="h-9 px-4 rounded-md border border-[var(--color-hairline)] text-[var(--color-parchment)] text-[13px] font-medium hover:border-[var(--color-danger)] hover:text-[var(--color-danger)] transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    End session
+                  </button>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Loading overlay while generating report */}
       <LoadingOverlay open={isGenerating} />

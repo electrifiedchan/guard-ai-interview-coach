@@ -39,3 +39,9 @@ if errorlevel 1 exit /b 1
 echo.
 "%ROOT%\venv\Scripts\python.exe" test_timeline_migration.py
 if errorlevel 1 exit /b 1
+echo.
+"%ROOT%\venv\Scripts\python.exe" test_focus_events.py
+if errorlevel 1 exit /b 1
+echo.
+"%ROOT%\venv\Scripts\python.exe" test_focus_consistency.py
+if errorlevel 1 exit /b 1

@@ -232,6 +232,44 @@ def _readiness_band(score: float) -> str:
     return "Building"
 
 
+def _avg_composure(values) -> float:
+    """The ONE definition of a session's average composure (0-100, 1 decimal).
+
+    Every screen that shows a session's focus/composure score reads it through
+    here: the dashboard session list and trend, the replay stats, and the report
+    shown right after a session ends. They used to compute it separately (the
+    report averaged one live reading per answer, the dashboard averaged every
+    frame), so the same session showed two different numbers. A missing
+    composure counts as 0, the same as the dashboard has always done.
+
+    Callers must pass the frames oldest-first so the float sum is identical.
+    """
+    comps = [float(v) if v is not None else 0.0 for v in values]
+    if not comps:
+        return 0.0
+    return round(sum(comps) / len(comps), 1)
+
+
+def get_session_focus(session_id: str) -> dict | None:
+    """Average composure for one run, or None if it recorded no frames.
+
+    Exact session_id match: a run's frames are stored under its own
+    "{candidate_id}__{rand}" id, and the dashboard groups on that same id.
+    """
+    with contextlib.closing(_db()) as conn:
+        rows = conn.execute(
+            "SELECT composure FROM timeline_frames WHERE session_id = ? ORDER BY t",
+            (session_id,),
+        ).fetchall()
+    if not rows:
+        return None
+    return {
+        "session_id": session_id,
+        "avg_composure": _avg_composure(r[0] for r in rows),
+        "frames": len(rows),
+    }
+
+
 def _score_session(eye_pct: float, avg_comp: float, streak_s: float, recoveries: int) -> float:
     """Weighted readiness blend for a single session, clamped 0-100.
 
@@ -322,7 +360,7 @@ def get_dashboard_summary(candidate_id: str | None = None, days: int = 84) -> di
                 "frames": 0,
                 "started_at": f["t"],
                 "ended_at": f["t"],
-                "comp_sum": 0.0,
+                "comps": [],
                 "min_composure": f["composure"],
                 "straight": 0,
                 "side": 0,
@@ -339,7 +377,7 @@ def get_dashboard_summary(candidate_id: str | None = None, days: int = 84) -> di
         s["frames"] += 1
         s["ended_at"] = f["t"]
         comp = f["composure"] if f["composure"] is not None else 0.0
-        s["comp_sum"] += comp
+        s["comps"].append(comp)
         s["min_composure"] = min(s["min_composure"], comp)
 
         gaze = f["gaze"] or ""
@@ -387,7 +425,7 @@ def get_dashboard_summary(candidate_id: str | None = None, days: int = 84) -> di
         eye = _pct(s["straight"], fc)
         talk = _pct(s["talking"], fc)
         streak_s = round(s["max_streak_s"], 1)
-        avg_comp = round(s["comp_sum"] / fc, 1) if fc else 0.0
+        avg_comp = _avg_composure(s["comps"])
         computed.append({
             "session_id": s["session_id"],
             "started_at": s["started_at"],
@@ -460,11 +498,18 @@ def get_dashboard_summary(candidate_id: str | None = None, days: int = 84) -> di
          "delta": latest["recovery_count"], "spark": _spark("recovery_count", cumulative=True)},
     ]
 
-    # --- Readiness (latest session score, band, delta vs prev) --------------
+    # --- Readiness: the AVERAGE across all sessions in the window -----------
+    # One short or unlucky run must not swing the headline, so this is the mean
+    # of every session's readiness. delta_vs_prev is how much the latest session
+    # moved that average (average now minus average without it).
+    avg_readiness = sum(c["readiness"] for c in computed) / len(computed)
     readiness = {
-        "score": int(round(latest["readiness"])),
-        "delta_vs_prev": int(round(latest["readiness"] - computed[-2]["readiness"])) if len(computed) >= 2 else 0,
-        "band": _readiness_band(latest["readiness"]),
+        "score": int(round(avg_readiness)),
+        "delta_vs_prev": (
+            int(round(avg_readiness - sum(c["readiness"] for c in computed[:-1]) / (len(computed) - 1)))
+            if len(computed) >= 2 else 0
+        ),
+        "band": _readiness_band(avg_readiness),
     }
 
     # --- Composure trend ----------------------------------------------------
@@ -608,6 +653,10 @@ def get_timeline(session_id: str) -> dict:
             "type": m["type"] or "EVENT",
             "caption": m["caption"] or "",
             "evidence_url": m.get("evidence_url"),
+            # Flag identity (MOBILE_DEVICE, TAB_SWITCH, ...). NULL on rows
+            # written before the column existed.
+            "kind": m.get("kind"),
+            "duration_sec": m.get("duration_sec"),
         }
         for m in moment_rows
     ]
@@ -631,6 +680,9 @@ def get_timeline(session_id: str) -> dict:
 
     eye_contact_pct = _pct(straight, fc)
     talking_pct = _pct(talking, fc)
+    # Same function the dashboard and the post-session report use, so the three
+    # can never show different numbers for one session.
+    avg_composure = _avg_composure(r["composure"] for r in rows)
 
     if fc == 0:
         headline = "No telemetry recorded for this session."
@@ -651,6 +703,8 @@ def get_timeline(session_id: str) -> dict:
             "eye_contact_pct": eye_contact_pct,
             "talking_pct": talking_pct,
             "longest_focus_streak_s": round(best_run_s or 0.0, 1),
+            "avg_composure": avg_composure,
+            "frames": fc,
         },
         "frames": frames,
         "moments": moments,

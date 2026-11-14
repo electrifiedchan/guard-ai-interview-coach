@@ -22,13 +22,18 @@ interface ReportData {
     next_actions: string[];
     readiness: string;
   };
-  average_focus_score: number;
+  /** Average composure from the recorded camera frames, or null if none. */
+  average_focus_score: number | null;
   turns_completed: number;
 }
 
 export default function ReportPage() {
   const router = useRouter();
   const [data, setData] = useState<ReportData | null>(null);
+  // The session's average composure as the history computes it. Read from the
+  // same endpoint and the same backend function as the dashboard's session
+  // list, so the number here and the one in history cannot differ.
+  const [timelineFocus, setTimelineFocus] = useState<number | null>(null);
   const [frames, setFrames] = useState<TimelineFrame[]>([]);
   const [moments, setMoments] = useState<TimelineMoment[]>([]);
   const [timelineState, setTimelineState] =
@@ -66,6 +71,8 @@ export default function ReportPage() {
       const nextFrames: TimelineFrame[] = payload.frames ?? [];
       setFrames(nextFrames);
       setMoments(payload.moments ?? []);
+      const avg = payload.stats?.avg_composure;
+      setTimelineFocus(nextFrames.length > 0 && typeof avg === "number" ? avg : null);
       setTimelineState(nextFrames.length > 0 ? "ready" : "unavailable");
     } catch {
       // The coaching report is the main event; a missing timeline degrades the
@@ -95,18 +102,25 @@ export default function ReportPage() {
     );
   }
 
-  const focusScore = Math.round(data.average_focus_score || 0);
+  // Rounded the same way the history rounds it (Math.round of the one-decimal
+  // average), so 52.5 reads as 53 here and there. Null means the camera
+  // recorded nothing for this session; say so rather than show a made-up 0 or 100.
+  const rawFocus = timelineFocus ?? data.average_focus_score;
+  const focusScore = typeof rawFocus === "number" ? Math.round(rawFocus) : null;
   const focusColor =
+    focusScore === null ? "text-[var(--color-slate)]" :
     focusScore >= 80 ? "text-emerald-400" :
     focusScore >= 50 ? "text-amber-400" :
     "text-rose-500";
 
   const overallGrade =
+    focusScore === null ? "NO CAMERA DATA" :
     focusScore >= 80 ? "STRONG" :
     focusScore >= 60 ? "MODERATE" :
     "NEEDS WORK";
 
   const gradeColor =
+    focusScore === null ? "text-[var(--color-slate)] border-[var(--color-hairline)] bg-[var(--color-surface)]" :
     focusScore >= 80 ? "text-emerald-400 border-emerald-400/30 bg-emerald-400/[0.06]" :
     focusScore >= 60 ? "text-amber-400 border-amber-400/30 bg-amber-400/[0.06]" :
     "text-rose-400 border-rose-400/30 bg-rose-400/[0.06]";
@@ -146,8 +160,10 @@ export default function ReportPage() {
             <Eye size={18} className="text-[var(--color-slate)]" />
             <span className="eyebrow">Focus Score</span>
             <span className={`text-[32px] font-display font-semibold tabular leading-none ${focusColor}`}>
-              {focusScore}
-              <span className="text-[var(--color-fog)] text-[18px] font-medium ml-0.5">%</span>
+              {focusScore ?? "—"}
+              {focusScore !== null && (
+                <span className="text-[var(--color-fog)] text-[18px] font-medium ml-0.5">%</span>
+              )}
             </span>
           </div>
           <div className="lift-1 rounded-lg p-5 flex flex-col items-center gap-2">

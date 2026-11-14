@@ -32,9 +32,9 @@ export const PANEL_GUIDES = {
   },
   readiness: {
     reading:
-      "A single 0–100 score blending eye contact, speaking time, recoveries and consistency across your recent sessions. The ticks on the track are the band boundaries at 40, 70 and 85; the brighter tick at 70 is where 'Interview Ready' starts.",
+      "A single 0–100 score: the average, across all your sessions, of a blend of eye contact, speaking time, recoveries and consistency. The ticks on the track are the band boundaries at 40, 70 and 85; the brighter tick at 70 is where 'Interview Ready' starts.",
     healthy:
-      "70 or above. Below 40 is Building, 40–70 Improving, 85+ Sharp. The number under the ring compares you to last week, so a small positive delta every week beats one big jump.",
+      "70 or above. Below 40 is Building, 40–70 Improving, 85+ Sharp. The number under the ring shows how your latest session moved that average, so a small positive step every session beats one big jump.",
     action:
       "This is a lagging score — it moves when the habits underneath it move. Fix the panel marked 'Work on this next' and this follows within a few sessions.",
   },

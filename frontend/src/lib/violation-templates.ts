@@ -8,7 +8,9 @@ export type ViolationType =
   | "PROHIBITED_ITEM"
   | "MULTIPLE_FACES"
   | "NO_FACE"
-  | "TALKING";
+  | "TALKING"
+  | "TAB_SWITCH"
+  | "FULLSCREEN_EXIT";
 
 export type Severity = "info" | "warn" | "amber" | "danger";
 
@@ -120,6 +122,28 @@ export const VIOLATION_TEMPLATES: Record<ViolationType, ViolationTemplate> = {
     coachAdvice:
       "If you're a 'think out loud' type, that's fine — just keep it framed (\"let me think this through out loud…\"). Silence in the room otherwise is your friend.",
     frameCaption: "Speech was picked up here, off your answer turn.",
+  },
+  TAB_SWITCH: {
+    title: "Left the interview window",
+    severity: "amber",
+    whatHappened: (b) =>
+      `You switched away from the interview ${b.count} time${b.count === 1 ? "" : "s"}, about ${b.approx_total_seconds}s in total.`,
+    whyItMatters:
+      "Most proctored interviews watch for tab and window switches. Even a quick look at another tab can end the session or be read as looking something up.",
+    coachAdvice:
+      "Before you start, close other tabs and apps and silence notifications. If you need to check something, say so out loud first, as you would with a real interviewer.",
+    frameCaption: "You were on another tab or window here.",
+  },
+  FULLSCREEN_EXIT: {
+    title: "Left fullscreen",
+    severity: "warn",
+    whatHappened: (b) =>
+      `Fullscreen was exited ${b.count} time${b.count === 1 ? "" : "s"}, about ${b.approx_total_seconds}s in total.`,
+    whyItMatters:
+      "Many assessment platforms require fullscreen and flag every exit, because it means other windows could be visible.",
+    coachAdvice:
+      "Stay in fullscreen for the whole session. Pressing Esc is the usual accident, so keep your hands away from the top-left of the keyboard while you answer.",
+    frameCaption: "Fullscreen was off here.",
   },
 };
 
